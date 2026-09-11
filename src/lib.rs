@@ -24,7 +24,9 @@ use core::{
     pin::pin,
     time::Duration,
 };
-use std::{collections::VecDeque, time::Instant};
+extern crate alloc;
+use alloc::collections::VecDeque;
+use std::time::Instant;
 
 use branches::unlikely;
 pub use error::*;
@@ -265,6 +267,55 @@ macro_rules! shared_impl {
         pub fn is_closed(&self) -> bool {
             let internal = acquire_internal(&self.internal);
             internal.send_count == 0 && internal.recv_count == 0
+        }
+
+        /// Discards all messages currently available on the receive side.
+        ///
+        /// This removes every value from the channel queue and also accepts
+        /// values from senders that are blocked on a full or zero-capacity
+        /// channel, then drops those values. From the senders' point of view
+        /// the corresponding `send` operations complete successfully; the
+        /// data is simply discarded by this side.
+        ///
+        /// The channel itself stays open. Queue capacity is preserved so later
+        /// sends do not need to reallocate the internal buffer from scratch.
+        /// Messages that arrive after `clear` returns are not affected.
+        ///
+        /// Returns [`ReceiveError`] if the receive side is already closed
+        /// (for example after [`close`](Self::close)).
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// let (s, r) = kanal::bounded(4);
+        /// s.send(1).unwrap();
+        /// s.send(2).unwrap();
+        /// assert_eq!(r.len(), 2);
+        /// r.clear().unwrap();
+        /// assert_eq!(r.len(), 0);
+        /// s.send(3).unwrap();
+        /// assert_eq!(r.recv().unwrap(), 3);
+        /// ```
+        pub fn clear(&self) -> Result<(), ReceiveError> {
+            let mut internal = acquire_internal(&self.internal);
+            if unlikely(internal.recv_count == 0) {
+                return Err(ReceiveError());
+            }
+            let senders = internal.take_sends();
+            let cap = internal.queue.capacity();
+            let dropped = core::mem::replace(
+                &mut internal.queue,
+                VecDeque::with_capacity(cap),
+            );
+            drop(internal);
+            drop(dropped);
+            for p in senders {
+                // SAFETY: detached via take_sends; complete exactly once
+                unsafe {
+                    let _ = p.recv();
+                }
+            }
+            Ok(())
         }
     };
 }
